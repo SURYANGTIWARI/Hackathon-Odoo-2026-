@@ -1,3 +1,5 @@
+import { useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 
 export function PageHeader({ title, subtitle, action }) {
@@ -14,7 +16,32 @@ export function StatusBadge({ value }) {
 }
 
 export function Modal({ title, description, onClose, children, wide = false }) {
-  return <div className="workspace-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className={`workspace-modal ${wide ? 'workspace-modal--wide' : ''}`} role="dialog" aria-modal="true" aria-label={title}><header className="workspace-modal-head"><div><h2>{title}</h2>{description && <p>{description}</p>}</div><button type="button" className="icon-button" onClick={onClose} aria-label="Close dialog"><X size={18} /></button></header>{children}</section></div>;
+  const closeRef = useRef(onClose);
+  useEffect(() => { closeRef.current = onClose; }, [onClose]);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    const previousOverscroll = document.body.style.overscrollBehavior;
+    document.body.style.overflow = 'hidden';
+    document.body.style.overscrollBehavior = 'none';
+    const handleKeyDown = (event) => { if (event.key === 'Escape') closeRef.current(); };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.body.style.overscrollBehavior = previousOverscroll;
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, []);
+
+  return createPortal(
+    <div className="workspace-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className={`workspace-modal ${wide ? 'workspace-modal--wide' : ''}`} role="dialog" aria-modal="true" aria-label={title}>
+        <header className="workspace-modal-head"><div><h2>{title}</h2>{description && <p>{description}</p>}</div><button type="button" className="icon-button" onClick={onClose} aria-label="Close dialog"><X size={18} /></button></header>
+        <div className="workspace-modal-content">{children}</div>
+      </section>
+    </div>,
+    document.body,
+  );
 }
 
 export function FormField({ label, children, hint, required = false }) {
