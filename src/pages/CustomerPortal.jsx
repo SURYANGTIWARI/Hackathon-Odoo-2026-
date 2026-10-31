@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { Activity, AlertCircle, ArrowRight, Bell, CalendarClock, CheckCircle2, CircleHelp, CreditCard, Download, FileText, LifeBuoy, LockKeyhole, ReceiptText, RefreshCw, Settings2, ShieldCheck, UserRound, Workflow } from 'lucide-react';
+import { Activity, AlertCircle, ArrowRight, Bell, CalendarClock, CheckCircle2, CreditCard, Download, FileText, LockKeyhole, Mail, ReceiptText, RefreshCw, Settings2, ShieldCheck, UserRound, Workflow } from 'lucide-react';
 import { supabase } from '../lib/supabase.js';
 import { formatInr } from '../lib/currency.js';
 import { formatDate } from '../lib/formatDate.js';
@@ -194,7 +194,7 @@ function ProfileSection({ customer, profile, user, onEdit, onPassword }) {
 }
 
 function SupportSection() {
-  return <SectionCard eyebrow="HELP" title="Contact your account administrator"><div className="support-card"><span className="support-icon"><LifeBuoy size={22} /></span><div><h3>Need help with your account?</h3><p>The current database does not configure a support email, contact number, or secure support-request workflow. Please contact the Brightloop administrator who manages your subscription to ask about billing, plan changes, or account access.</p></div></div><div className="workspace-info-note"><CircleHelp size={17} /><span>A support form will be available once a protected support backend is added. This page does not send or store requests.</span></div></SectionCard>;
+  return <SectionCard eyebrow="HELP" title="Contact support"><div className="support-card"><span className="support-icon"><Mail size={21} /></span><div><h3>Brightloop Support</h3><p>Need help with your subscriptions, invoices, or payments? Contact our support team.</p><a className="support-email" href="mailto:support@brightloop.in"><Mail size={16} /><span><small>Support Email</small>support@brightloop.in</span></a></div></div></SectionCard>;
 }
 
 function InvoiceModal({ invoice, onClose }) {
