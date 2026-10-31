@@ -154,20 +154,32 @@ Deno.serve(async (request) => {
     if (!payload.user_id || typeof payload.active !== 'boolean' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(payload.user_id)) {
       return jsonResponse({ error: 'Provide a valid staff user_id and active boolean.' }, 400, origin);
     }
-    // Deactivation first removes all application data access via RLS, then blocks future Auth sessions.
+    let passwordResetRequired = false;
+    if (payload.active) {
+      const { data: targetProfile, error: targetProfileError } = await adminClient.from('profiles')
+        .select('role,is_active').eq('id', payload.user_id).maybeSingle();
+      if (targetProfileError) return jsonResponse({ error: 'Staff account could not be verified.' }, 503, origin);
+      if (targetProfile?.role !== 'STAFF') return jsonResponse({ error: 'Staff account not found.' }, 404, origin);
+      passwordResetRequired = targetProfile.is_active === false;
+    }
+    // Deactivation first removes application data access through RLS. Rotate the
+    // credential to terminate refresh sessions where Auth supports password-change
+    // session invalidation, then ban future sign-ins. The random credential is never
+    // returned; Staff must use password recovery after an Admin reactivates them.
     if (!payload.active) {
       const { error } = await adminClient.rpc('service_set_staff_active', { p_user_id: payload.user_id, p_actor_id: authData.user.id, p_active: false });
       if (error) return jsonResponse({ error: 'Staff account status could not be updated.' }, 404, origin);
     }
-    const { error: authUpdateError } = await adminClient.auth.admin.updateUserById(payload.user_id, {
-      ban_duration: payload.active ? 'none' : '876000h',
-    });
+    const authUpdate = payload.active
+      ? { ban_duration: 'none' }
+      : { password: `${crypto.randomUUID()}-${crypto.randomUUID()}Aa1!`, ban_duration: '876000h' };
+    const { error: authUpdateError } = await adminClient.auth.admin.updateUserById(payload.user_id, authUpdate);
     if (authUpdateError) return jsonResponse({ error: 'Database access status changed, but Auth session blocking failed. Retry this request.' }, 503, origin);
     if (payload.active) {
       const { error } = await adminClient.rpc('service_set_staff_active', { p_user_id: payload.user_id, p_actor_id: authData.user.id, p_active: true });
       if (error) return jsonResponse({ error: 'Auth access was restored, but database access remains disabled. Retry this request.' }, 503, origin);
     }
-    return jsonResponse({ user_id: payload.user_id, active: payload.active }, 200, origin);
+    return jsonResponse({ user_id: payload.user_id, active: payload.active, password_reset_required: passwordResetRequired }, 200, origin);
   }
 
   return jsonResponse({ error: 'Unsupported action.' }, 400, origin);

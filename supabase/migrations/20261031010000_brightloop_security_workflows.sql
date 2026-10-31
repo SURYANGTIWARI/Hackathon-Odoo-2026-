@@ -6,6 +6,180 @@ begin;
 -- Exactly one administrator may exist. Replacement is a controlled SQL Editor operation.
 create unique index profiles_single_admin_uidx on public.profiles ((role)) where role = 'ADMIN';
 
+-- Fence previously issued JWTs across Staff deactivation/reactivation. Supabase JWTs are
+-- stateless, so RLS rejects tokens issued before this boundary even after reactivation.
+alter table public.profiles add column auth_valid_after timestamptz not null default 'epoch'::timestamptz;
+create table public.staff_session_revocations (
+  session_id uuid primary key,
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  revoked_by uuid references public.profiles(id) on delete set null,
+  revoked_at timestamptz not null default now()
+);
+alter table public.staff_session_revocations enable row level security;
+revoke all on table public.staff_session_revocations from public, anon, authenticated;
+create or replace function app_private.current_role()
+returns public.app_role
+language sql stable security definer
+set search_path = ''
+set row_security = off
+as $$
+  select p.role from public.profiles p
+  where p.id = (select auth.uid())
+    and p.is_active = true
+    and to_timestamp(coalesce(nullif((select auth.jwt())->>'iat', '')::numeric, 0)) >= p.auth_valid_after
+    and nullif((select auth.jwt())->>'session_id','') is not null
+    and not exists (
+      select 1 from public.staff_session_revocations r
+      where r.session_id=nullif((select auth.jwt())->>'session_id','')::uuid
+    )
+$$;
+
+-- All payments are written through checked RPCs. Idempotency prevents duplicate
+-- records after client/network retries; the audit table retains before/after values.
+alter table public.payments add column idempotency_key uuid not null default gen_random_uuid();
+create unique index payments_idempotency_key_uidx on public.payments(idempotency_key);
+create table public.payment_audit_events (
+  id bigint generated always as identity primary key,
+  payment_id uuid not null references public.payments(id) on delete restrict,
+  actor_id uuid references public.profiles(id) on delete set null,
+  action text not null check (action in ('PAYMENT_RECORDED', 'STATUS_CHANGED')),
+  old_values jsonb,
+  new_values jsonb not null,
+  reason text,
+  occurred_at timestamptz not null default now()
+);
+create index payment_audit_events_payment_time_idx on public.payment_audit_events(payment_id, occurred_at desc);
+alter table public.payment_audit_events enable row level security;
+revoke all on table public.payment_audit_events from public, anon, authenticated;
+grant select on public.payment_audit_events to authenticated;
+create policy payment_audit_events_admin_read on public.payment_audit_events for select to authenticated
+using (app_private.is_admin());
+create policy payment_audit_events_no_client_insert on public.payment_audit_events for insert to authenticated with check (false);
+create policy payment_audit_events_no_client_update on public.payment_audit_events for update to authenticated using (false) with check (false);
+create policy payment_audit_events_no_client_delete on public.payment_audit_events for delete to authenticated using (false);
+
+-- Direct payment writes bypass the payment-recording and audit workflow.
+revoke insert, update, delete on public.payments from authenticated;
+drop policy payments_insert_staff on public.payments;
+drop policy payments_update_staff on public.payments;
+drop policy payments_delete_admin on public.payments;
+create policy payments_insert_denied on public.payments for insert to authenticated with check (false);
+create policy payments_update_denied on public.payments for update to authenticated using (false) with check (false);
+create policy payments_delete_denied on public.payments for delete to authenticated using (false);
+
+create or replace function public.record_payment(
+  p_invoice_id uuid,
+  p_amount numeric(12,2),
+  p_method public.payment_method,
+  p_idempotency_key uuid,
+  p_reference text default null,
+  p_notes text default null,
+  p_initial_status public.payment_status default 'PENDING'
+)
+returns uuid language plpgsql security definer
+set search_path = '' set row_security = off
+as $$
+declare
+  invoice_row public.invoices%rowtype;
+  existing public.payments%rowtype;
+  new_payment public.payments%rowtype;
+begin
+  if not app_private.is_staff_or_admin() then raise exception 'Staff or Admin role required' using errcode='42501'; end if;
+  if p_invoice_id is null or p_amount is null or p_amount <= 0 or p_idempotency_key is null or p_method is null then
+    raise exception 'Invoice, positive amount, payment method, and idempotency key are required';
+  end if;
+  if p_initial_status is null or p_initial_status not in ('PENDING','SUCCEEDED') then raise exception 'A new payment must begin as pending or succeeded'; end if;
+  if p_amount::text in ('NaN', 'Infinity', '-Infinity') or p_amount<>round(p_amount,2) then
+    raise exception 'Payment amount must be finite and expressed to two decimal places';
+  end if;
+
+  select * into existing from public.payments where idempotency_key=p_idempotency_key;
+  if found then
+    if existing.invoice_id<>p_invoice_id or existing.amount<>p_amount or existing.method<>p_method
+      or existing.reference is distinct from nullif(trim(p_reference), '') or existing.notes is distinct from p_notes then
+      raise exception 'Idempotency key was already used for a different payment';
+    end if;
+    return existing.id;
+  end if;
+
+  -- Serialize successful payments per invoice before checking the remaining balance.
+  select * into invoice_row from public.invoices where id=p_invoice_id for update;
+  if not found then raise exception 'Invoice not found'; end if;
+  if invoice_row.status in ('DRAFT','VOID') then raise exception 'Payments require an issued invoice'; end if;
+  if p_amount > invoice_row.outstanding_amount then raise exception 'Payment exceeds the invoice outstanding balance'; end if;
+
+  insert into public.payments(invoice_id,customer_id,amount,currency_code,method,status,reference,notes,created_by,idempotency_key)
+  values(p_invoice_id,invoice_row.customer_id,p_amount,'INR',p_method,p_initial_status,nullif(trim(p_reference),''),p_notes,(select auth.uid()),p_idempotency_key)
+  on conflict (idempotency_key) do nothing
+  returning * into new_payment;
+  if not found then
+    select * into existing from public.payments where idempotency_key=p_idempotency_key;
+    if existing.invoice_id<>p_invoice_id or existing.amount<>p_amount or existing.method<>p_method
+      or existing.reference is distinct from nullif(trim(p_reference), '') or existing.notes is distinct from p_notes then
+      raise exception 'Idempotency key was already used for a different payment';
+    end if;
+    return existing.id;
+  end if;
+
+  insert into public.payment_audit_events(payment_id,actor_id,action,new_values)
+  values(new_payment.id,(select auth.uid()),'PAYMENT_RECORDED',jsonb_build_object(
+    'invoice_id',new_payment.invoice_id,'customer_id',new_payment.customer_id,'amount',new_payment.amount,
+    'currency_code',new_payment.currency_code,'method',new_payment.method,'status',new_payment.status,
+    'reference',new_payment.reference
+  ));
+  return new_payment.id;
+end;
+$$;
+
+create or replace function public.transition_payment_status(
+  p_payment_id uuid,
+  p_new_status public.payment_status,
+  p_reason text default null
+)
+returns void language plpgsql security definer
+set search_path = '' set row_security = off
+as $$
+declare payment_row public.payments%rowtype; invoice_row public.invoices%rowtype; prior_values jsonb; next_values jsonb;
+begin
+  if not app_private.is_staff_or_admin() then raise exception 'Staff or Admin role required' using errcode='42501'; end if;
+  if p_payment_id is null or p_new_status is null then raise exception 'Payment and target status are required'; end if;
+  select invoice_id into payment_row.invoice_id from public.payments where id=p_payment_id;
+  if not found then raise exception 'Payment not found'; end if;
+  select * into invoice_row from public.invoices where id=payment_row.invoice_id for update;
+  if not found then raise exception 'Payment invoice not found'; end if;
+  select * into payment_row from public.payments where id=p_payment_id for update;
+  if payment_row.status=p_new_status then return; end if;
+  if not ((payment_row.status='PENDING' and p_new_status in ('SUCCEEDED','FAILED'))
+      or (payment_row.status='SUCCEEDED' and p_new_status='REFUNDED')) then
+    raise exception 'Invalid payment status transition';
+  end if;
+  if p_new_status='SUCCEEDED' then
+    if invoice_row.status in ('DRAFT','VOID') or payment_row.amount>invoice_row.outstanding_amount then
+      raise exception 'Payment cannot succeed against this invoice balance';
+    end if;
+  end if;
+  if p_new_status='REFUNDED' and length(trim(coalesce(p_reason,'')))<3 then
+    raise exception 'A reason is required to record a refund';
+  end if;
+  if p_new_status='REFUNDED' and exists(select 1 from public.subscription_renewals where invoice_id=payment_row.invoice_id) then
+    raise exception 'This payment has already renewed a subscription; use the reviewed subscription reversal process before refunding';
+  end if;
+  prior_values:=jsonb_build_object('invoice_id',payment_row.invoice_id,'amount',payment_row.amount,
+    'currency_code',payment_row.currency_code,'method',payment_row.method,'status',payment_row.status,
+    'reference',payment_row.reference);
+  update public.payments set status=p_new_status,updated_at=now() where id=p_payment_id;
+  next_values:=jsonb_build_object('invoice_id',payment_row.invoice_id,'amount',payment_row.amount,
+    'currency_code',payment_row.currency_code,'method',payment_row.method,'status',p_new_status,
+    'reference',payment_row.reference);
+  insert into public.payment_audit_events(payment_id,actor_id,action,old_values,new_values,reason)
+  values(p_payment_id,(select auth.uid()),'STATUS_CHANGED',prior_values,next_values,nullif(trim(p_reason),''));
+end;
+$$;
+revoke all on function public.record_payment(uuid,numeric,public.payment_method,uuid,text,text,public.payment_status) from public,anon;
+revoke all on function public.transition_payment_status(uuid,public.payment_status,text) from public,anon;
+grant execute on function public.record_payment(uuid,numeric,public.payment_method,uuid,text,text,public.payment_status) to authenticated;
+grant execute on function public.transition_payment_status(uuid,public.payment_status,text) to authenticated;
+
 -- Customer records created by staff cannot be linked to an arbitrary Auth identity.
 revoke insert on public.customers from authenticated;
 grant insert (email, phone, business_name, tax_identifier, billing_address, shipping_address, notes) on public.customers to authenticated;
@@ -224,6 +398,7 @@ begin
   if p_discount_id is null then return 0; end if;
   select * into d from public.discounts where id = p_discount_id and is_active and (starts_at is null or starts_at <= now()) and (ends_at is null or ends_at >= now());
   if not found then raise exception 'Discount is not active'; end if;
+  if d.usage_limit is not null and d.used_count>=d.usage_limit then raise exception 'Discount usage limit reached'; end if;
   select coalesce(sum(qi.quantity) filter (where d.scope='ALL' or (d.scope='PRODUCTS' and qi.product_id is not null) or (d.scope='PLANS' and qi.plan_id is not null)),0),
          coalesce(sum(qi.line_subtotal) filter (where d.scope='ALL' or (d.scope='PRODUCTS' and qi.product_id is not null) or (d.scope='PLANS' and qi.plan_id is not null)),0)
     into v_quantity,v_subtotal from public.quotation_items qi where qi.quotation_id=p_quotation_id;
@@ -369,10 +544,70 @@ grant execute on function public.create_invoice_with_items(jsonb,jsonb) to authe
 revoke update (customer_id,subscription_id,billing_period_start,billing_period_end,discount_amount,discount_id,status) on public.invoices from authenticated;
 
 -- Subscription item taxes are selected from configured rates; future invoices take new snapshots.
-revoke insert (subscription_id,product_id,variant_id,description,quantity,unit_price) on public.subscription_items from authenticated;
-revoke update (subscription_id,product_id,variant_id,description,quantity,unit_price) on public.subscription_items from authenticated;
-grant insert (subscription_id,product_id,variant_id,description,quantity,unit_price,tax_rate_id) on public.subscription_items to authenticated;
-grant update (subscription_id,product_id,variant_id,description,quantity,unit_price,tax_rate_id) on public.subscription_items to authenticated;
+-- The foundation granted table-wide INSERT/UPDATE. Remove both; creation and edits
+-- are performed only by checked SECURITY DEFINER RPCs.
+revoke insert, update on public.subscription_items from authenticated;
+
+create or replace function public.validate_subscription_item_tax_rate()
+returns trigger language plpgsql
+set search_path = ''
+as $$
+begin
+  if new.tax_rate_id is not null and not exists (
+    select 1 from public.tax_rates tr where tr.id=new.tax_rate_id and tr.is_active
+  ) then
+    raise exception 'Subscription tax rate must reference an active configured rate';
+  end if;
+  return new;
+end;
+$$;
+create trigger subscription_item_tax_rate_check before insert or update of tax_rate_id on public.subscription_items
+for each row execute function public.validate_subscription_item_tax_rate();
+
+create or replace function public.update_subscription_item(
+  p_item_id uuid,
+  p_description text,
+  p_quantity numeric(12,2),
+  p_unit_price numeric(12,2),
+  p_product_id uuid,
+  p_variant_id uuid,
+  p_tax_rate_id uuid
+)
+returns void language plpgsql security definer
+set search_path = '' set row_security = off
+as $$
+declare item_subscription uuid; subscription_state public.subscription_status; variant_product uuid;
+begin
+  if not app_private.is_staff_or_admin() then raise exception 'Staff or Admin role required' using errcode='42501'; end if;
+  if p_item_id is null or p_description is null or length(trim(p_description))=0 or length(p_description)>500
+      or p_quantity is null or p_quantity<=0 or p_unit_price is null or p_unit_price<0 then
+    raise exception 'Provide a description, positive quantity, and non-negative unit price';
+  end if;
+  select subscription_id into item_subscription from public.subscription_items where id=p_item_id for update;
+  if not found then raise exception 'Subscription item not found'; end if;
+  select status into subscription_state from public.subscriptions where id=item_subscription for update;
+  if subscription_state not in ('PENDING','ACTIVE','PAUSED') then
+    raise exception 'Items cannot be changed on a closed or expired subscription';
+  end if;
+  if p_tax_rate_id is not null and not exists(select 1 from public.tax_rates where id=p_tax_rate_id and is_active) then
+    raise exception 'Subscription tax rate must reference an active configured rate';
+  end if;
+  if p_variant_id is not null then
+    select v.product_id into variant_product from public.product_variants v
+    join public.products p on p.id=v.product_id and p.is_active
+    where v.id=p_variant_id and v.is_active;
+    if not found then raise exception 'Selected product variant is missing or inactive'; end if;
+    if p_product_id is not null and p_product_id<>variant_product then raise exception 'Variant must belong to the selected product'; end if;
+    p_product_id:=variant_product;
+  elsif p_product_id is null or not exists(select 1 from public.products where id=p_product_id and is_active) then
+    raise exception 'Select an active product or variant';
+  end if;
+  update public.subscription_items set description=trim(p_description),quantity=p_quantity,unit_price=p_unit_price,
+    product_id=p_product_id,variant_id=p_variant_id,tax_rate_id=p_tax_rate_id where id=p_item_id;
+end;
+$$;
+revoke all on function public.update_subscription_item(uuid,text,numeric,numeric,uuid,uuid,uuid) from public,anon;
+grant execute on function public.update_subscription_item(uuid,text,numeric,numeric,uuid,uuid,uuid) to authenticated;
 create or replace function public.create_subscription_with_items(p_subscription jsonb,p_items jsonb)
 returns uuid language plpgsql security definer
 set search_path = '' set row_security = off
@@ -471,7 +706,10 @@ begin
   values(s.id,i.id,s.expiry_date,i.billing_period_end,(select auth.uid()));
   update public.subscriptions set
     expiry_date=greatest(coalesce(expiry_date,i.billing_period_end),i.billing_period_end),
-    status=case when status in ('EXPIRED','PENDING') then 'ACTIVE'::public.subscription_status else status end
+    status=case when status in ('EXPIRED','PENDING') then 'ACTIVE'::public.subscription_status else status end,
+    next_billing_date=case when auto_renew
+      then public.billing_cycle_start(start_date,billing_interval,billing_cycle_number)
+      else null end
   where id=s.id and status<>'CLOSED';
 end;
 $$;
@@ -547,7 +785,7 @@ begin
   if not found then raise exception 'Subscription not found'; end if;
   select id into existing_invoice from public.invoices where subscription_id=s.id and billing_period_start=p_period_start;
   if existing_invoice is not null then return existing_invoice; end if;
-  if s.status not in ('ACTIVE','EXPIRED') or not s.auto_renew or s.next_billing_date is distinct from p_period_start or p_period_start>p_as_of or (s.expiry_date is not null and p_period_start>s.expiry_date) then
+  if s.status not in ('ACTIVE','EXPIRED') or not s.auto_renew or s.next_billing_date is distinct from p_period_start or p_period_start>p_as_of then
     raise exception 'Subscription is not due for this recurring invoice';
   end if;
   if exists(select 1 from public.invoices i where i.subscription_id=s.id and i.status in ('DRAFT','ISSUED','PARTIALLY_PAID','OVERDUE') and i.outstanding_amount>0) then
@@ -575,7 +813,7 @@ as $$
 declare s record; generated uuid; count_generated integer:=0;
 begin
   if not app_private.is_staff_or_admin() and coalesce(auth.role(),'')<>'service_role' then raise exception 'Staff, Admin, or scheduler role required' using errcode='42501'; end if;
-  if p_limit<1 or p_limit>500 then raise exception 'Limit must be between 1 and 500'; end if;
+  if p_limit is null or p_limit<1 or p_limit>500 then raise exception 'Limit must be between 1 and 500'; end if;
   for s in select sub.id,sub.next_billing_date from public.subscriptions sub
     where sub.status in ('ACTIVE','EXPIRED') and sub.auto_renew and sub.next_billing_date<=p_as_of
     order by sub.next_billing_date,sub.id limit p_limit for update skip locked
@@ -670,7 +908,14 @@ begin
   if not exists(select 1 from public.profiles where id=p_actor_id and role='ADMIN' and is_active) then raise exception 'Active administrator required'; end if;
   if not exists(select 1 from public.profiles where id=p_user_id and role='STAFF') then raise exception 'Staff account not found'; end if;
   perform set_config('brightloop.audit_actor',p_actor_id::text,true);
-  update public.profiles set is_active=p_active where id=p_user_id and role='STAFF' and is_active is distinct from p_active;
+  if not p_active then
+    insert into public.staff_session_revocations(session_id,user_id,revoked_by)
+    select s.id,s.user_id,p_actor_id from auth.sessions s where s.user_id=p_user_id
+    on conflict (session_id) do nothing;
+  end if;
+  update public.profiles set is_active=p_active,
+    auth_valid_after=date_trunc('second',clock_timestamp())+interval '1 second'
+  where id=p_user_id and role='STAFF' and is_active is distinct from p_active;
 end;
 $$;
 
@@ -679,6 +924,7 @@ revoke all on function public.calculate_quotation_discount(uuid,uuid) from publi
 revoke all on function public.calculate_invoice_discount(uuid,uuid) from public,anon,authenticated;
 revoke all on function public.service_promote_staff_profile(uuid,uuid,uuid,text) from public,anon,authenticated;
 revoke all on function public.service_set_staff_active(uuid,uuid,boolean) from public,anon,authenticated;
+revoke all on function public.validate_subscription_item_tax_rate() from public,anon,authenticated;
 grant execute on function public.service_promote_staff_profile(uuid,uuid,uuid,text) to service_role;
 grant execute on function public.service_set_staff_active(uuid,uuid,boolean) to service_role;
 revoke all on function public.activate_subscription(uuid) from public,anon;

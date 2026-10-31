@@ -7,11 +7,24 @@ import BrandedIntro from './components/BrandedIntro.jsx';
 import LoadingState from './components/LoadingState.jsx';
 import { CustomerRoute, ProtectedRoute, PublicOnlyRoute } from './components/RouteGuards.jsx';
 import { pageDefinitions } from './pages/pageDefinitions.js';
-const PlaceholderPage = lazy(() => import('./pages/PlaceholderPage.jsx'));
 const LandingPage = lazy(() => import('./pages/LandingPage.jsx'));
 const AuthPage = lazy(() => import('./pages/AuthPage.jsx'));
 const DashboardPage = lazy(() => import('./pages/DashboardPage.jsx'));
 const CustomerPortal = lazy(() => import('./pages/CustomerPortal.jsx'));
+const AdminCatalogPage = lazy(() => import('./pages/AdminCatalogPage.jsx'));
+const CustomersPage = lazy(() => import('./pages/CustomersPage.jsx'));
+const SubscriptionsPage = lazy(() => import('./pages/SubscriptionsPage.jsx'));
+const CommercialPages = lazy(() => import('./pages/CommercialPages.jsx'));
+const SystemPages = lazy(() => import('./pages/SystemPages.jsx'));
+
+function AdminModule({ page }) {
+  if (page.path === 'customers') return <CustomersPage />;
+  if (page.path === 'products' || page.path === 'plans') return <AdminCatalogPage kind={page.path} />;
+  if (page.path === 'subscriptions') return <SubscriptionsPage />;
+  if (['quotations', 'invoices', 'payments'].includes(page.path)) return <CommercialPages kind={page.path} />;
+  if (['discounts', 'reports', 'settings'].includes(page.path)) return <SystemPages kind={page.path} />;
+  return <DashboardPage />;
+}
 
 function AppRoutes() {
   const { user, profile, authLoading } = useAuth();
@@ -27,12 +40,12 @@ function AppRoutes() {
         <Route element={<MainLayout />}>
           <Route path="/dashboard" element={<DashboardPage />} />
           {pageDefinitions.filter((page) => page.path !== 'dashboard').map((page) => (
-            <Route key={page.path} path={`/${page.path}`} element={<PlaceholderPage page={page} />} />
+            <Route key={page.path} path={`/${page.path}`} element={<AdminModule page={page} />} />
           ))}
         </Route>
       </Route>
       <Route element={<CustomerRoute />}>
-        <Route element={<MainLayout />}><Route path="/portal" element={<CustomerPortal />} /></Route>
+        <Route element={<MainLayout />}><Route path="/portal/*" element={<CustomerPortal />} /></Route>
       </Route>
       <Route path="*" element={<Navigate to={user && profile ? (profile.role === 'CUSTOMER' ? '/portal' : '/dashboard') : '/'} replace />} />
   </Routes></Suspense>;
