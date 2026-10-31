@@ -1,21 +1,30 @@
-# React + Vite
+# Brightloop — Subscription Management
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Brightloop is a React + Vite subscription management workspace. It includes a public landing page, Supabase Auth screens, an Admin/Staff intelligence dashboard, and a Customer portal. The dashboard and portal read live records through the existing Supabase client and RLS policies; other business modules remain clearly marked as foundations until their CRUD workflows are implemented.
 
-Currently, two official plugins are available:
+## Run locally
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```sh
+npm install
+npm run dev
+```
 
-## React Compiler
+Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` in the project-root `.env.local` file. Restart Vite after changing environment configuration. Never add a service-role or secret key to frontend variables.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Routes and account access
 
-## Expanding the ESLint configuration
+- `/` — public landing page
+- `/login` — Admin, Staff, and Customer login
+- `/signup` — public Customer registration only
+- `/reset-password` — Supabase password recovery
+- `/dashboard` — protected Admin/Staff workspace
+- `/portal` — protected Customer records, scoped by database RLS
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+The app loads the authenticated user's role from `public.profiles`; it does not accept roles from signup form input. Database migrations and staff account provisioning instructions are in [`supabase/SETUP.md`](supabase/SETUP.md). Do not treat the local SQL files as applied to a Supabase project until an administrator runs them.
 
+## Checks
 
-## Brightloop React foundation
-
-Run the app from this folder with `npm install` followed by `npm run dev`. The current foundation includes shared sidebar/topbar layout and placeholder routes for Dashboard, Customers, Products, Plans, Subscriptions, Quotations, Invoices, Payments, Discounts, Reports, and Settings. Database and authentication are not connected yet; no business records are fabricated.
+```sh
+npm run build
+npm run lint
+```

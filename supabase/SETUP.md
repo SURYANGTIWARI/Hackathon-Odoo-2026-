@@ -1,48 +1,78 @@
 # Brightloop Supabase setup
 
-The migration is local only until you apply it. Review `migrations/20261031000000_brightloop_database_foundation.sql` before running it in the Supabase SQL Editor. Do not paste or commit secret keys.
+These migrations are local project files and have **not** been applied. The schema is designed for INR only; monetary columns use fixed precision `NUMERIC(12,2)` (tax percentages use `NUMERIC(5,2)`). Do not put a Supabase service-role/secret key in the Vite app or `.env.local`.
 
-## Apply the schema
+## Fresh-project migration sequence
 
-1. Open Supabase Dashboard → SQL Editor.
-2. Paste the complete migration file and run it against the intended project.
-3. Confirm the `app_settings` row has `default_currency = INR`, and verify RLS is enabled on all tables.
-4. Enable email confirmation and set the allowed Site URL and redirect URLs before inviting users.
+Because the original foundation migration is still unapplied, use a **new, empty Supabase project** and apply both files in timestamp order before enabling application traffic:
 
-Public Auth signups always create `CUSTOMER` profiles. The signup trigger reads only `full_name` from user metadata and ignores role metadata. It provisions the matching customer row. Staff provisioning uses the Edge Function; it invites a new Auth identity, changes the generated profile to `STAFF`, and removes its temporary customer row.
+1. `supabase/migrations/20261031000000_brightloop_database_foundation.sql`
+2. `supabase/migrations/20261031010000_brightloop_security_workflows.sql`
 
-## Create the first ADMIN
+Prefer the Supabase CLI migration workflow for a linked project (`supabase link`, then `supabase db push`). Alternatively, run each complete SQL file in order through SQL Editor on a new project. Choose one method: SQL Editor execution does not automatically update the CLI migration history, so reconcile that history before any later `db push`. Do not run the second file alone, and do not rerun either file on a database where its objects already exist. Review the migration output for errors before configuring the app. These changes are local only; no migration was applied as part of this work.
 
-1. Create the initial account privately through Supabase Dashboard → Authentication → Users (or arrange an invite through a trusted administrator). Do not put its credentials in source code.
-2. Copy that Auth user's UUID from the Dashboard.
-3. In SQL Editor, run the following transaction after replacing the UUID literal:
+The second migration creates exactly-one-ADMIN enforcement and the hardened workflows. Enable email confirmation and configure the Auth Site URL and redirect URLs before inviting users. Add the frontend's local and production `/reset-password` URLs to the Auth redirect allow-list so recovery links can return to the password update screen. Configure `APP_ORIGIN` for the Edge Function to the exact frontend origin.
+
+## First administrator and replacement
+
+Public signup creates only `CUSTOMER`; role metadata supplied by a browser is ignored. To bootstrap the first administrator securely:
+
+1. Create the user's Auth identity privately in Supabase Dashboard → Authentication → Users. Do not hardcode or commit credentials.
+2. Copy that user's Auth UUID.
+3. Run the following once in SQL Editor after replacing the UUID. The unique partial index rejects a second ADMIN.
 
 ```sql
 begin;
-insert into public.profiles (id, full_name, role, is_active)
-select id, coalesce(raw_user_meta_data ->> 'full_name', ''), 'ADMIN', true
-from auth.users
+update public.profiles
+set role = 'ADMIN', is_active = true
 where id = 'REPLACE_WITH_AUTH_USER_UUID'::uuid
-on conflict (id) do update set role = 'ADMIN', is_active = true;
+  and role = 'CUSTOMER';
 delete from public.customers where profile_id = 'REPLACE_WITH_AUTH_USER_UUID'::uuid;
 commit;
 ```
 
-Use this bootstrap only for the initial administrator. No credential or admin role is hardcoded in the app. The client cannot change its own profile role.
+For a controlled administrator replacement, create and verify the replacement Auth identity first. In one SQL Editor transaction, demote and deactivate the old ADMIN, then promote and activate the replacement profile and remove its customer row. Verify both profile IDs and the resulting single ADMIN before commit. Example:
 
-## Deploy the staff account function
+```sql
+begin;
+update public.profiles set role = 'STAFF', is_active = false
+where id = 'OLD_ADMIN_AUTH_UUID'::uuid and role = 'ADMIN';
+update public.profiles set role = 'ADMIN', is_active = true
+where id = 'NEW_ADMIN_AUTH_UUID'::uuid and role = 'CUSTOMER';
+delete from public.customers where profile_id = 'NEW_ADMIN_AUTH_UUID'::uuid;
+commit;
+```
 
-Deploy `functions/staff-accounts/index.ts` with `supabase functions deploy staff-accounts` after linking the project. Keep JWT verification enabled. For local function testing, use `supabase/functions/.env` (ignored by Git) for any local-only values; do not copy a secret into Vite's `.env.local`. The function uses the caller's Auth JWT to verify an active `ADMIN` profile before performing any Auth Admin operation. The secret key is read only inside the Edge Function runtime from Supabase's injected `SUPABASE_SECRET_KEYS` (with legacy key support); it is never part of Vite or browser variables. Set the Edge Function `APP_ORIGIN` secret to the exact frontend origin if you want origin restriction. Invoke with POST JSON:
+Do not use this replacement procedure unless both UUIDs have been verified in `auth.users` and the new account is under the organization's control. If either update affects zero rows, stop and roll back. The partial unique index guarantees no committed state can contain two ADMIN profiles.
 
-- Create invitation: `{"action":"create","email":"staff@example.com","full_name":"Staff Name"}`
-- Activate/deactivate an existing staff profile: `{"action":"set_active","user_id":"AUTH_USER_UUID","active":false}`
+## Staff invitations and deactivation
 
-Deactivating a staff profile makes the database role helper return no role, blocking its RLS access. The staff-account endpoint does not delete users.
+Deploy `supabase/functions/staff-accounts/index.ts` only after the migrations have been applied and reviewed. Keep platform JWT verification enabled. The function verifies the caller's Auth user and active ADMIN profile, and its database promotion RPC independently verifies the same Admin on the server side. The function uses Supabase's server-side secret key only in the Edge Function runtime; never expose it to the browser. For local function development, use an ignored `supabase/functions/.env` file.
 
-## Invoice workflow
+Create an invitation with POST JSON:
 
-Use the atomic `create_quotation_with_items`, `create_subscription_with_items`, and `create_invoice_with_items` RPCs for header-and-line creation; direct client INSERT is revoked for those linked records. It creates a draft; call `issue_invoice(invoice_id)` to issue it. Successful payments are recorded against issued invoices, and invoice totals, paid amount, outstanding balance, and payment status are maintained from snapshots. Staff/customer catalog reads should use `products_catalog`; admins can retrieve costs through `admin_list_products_with_cost()`. Use `invoice_status_view.current_status` for a status that reflects the current date and can show newly overdue invoices without a scheduled job.
+```json
+{"action":"create","email":"staff@example.com","full_name":"Staff Name","idempotency_key":"GENERATE-A-NEW-UUID"}
+```
 
-## INR formatter
+A retry after a timeout must reuse the same `idempotency_key`. A different request uses a new UUID; because email is unique in the request ledger, an abandoned request for the same email must first be resolved by an administrator. The database stores the Admin actor, normalized email, request state, and Auth user reference, and prevents a second pending/completed invite for the same email. An invitation remains a CUSTOMER until the Admin-verified promotion transaction succeeds; a failed promotion is safe to retry and is not rolled back by deleting the Auth identity.
 
-Import `formatInr` from `src/lib/currency.js`. Supabase `NUMERIC(12,2)` values may arrive as strings; the formatter accepts numbers or numeric strings and returns `en-IN` INR formatting with two decimal places.
+Activate/deactivate with:
+
+```json
+{"action":"set_active","user_id":"STAFF_AUTH_UUID","active":false}
+```
+
+Deactivation first marks the profile inactive, which immediately removes application access under RLS, then applies a long Auth ban to prevent future sign-ins/refreshes. Reactivation lifts the ban before restoring database access. Supabase access JWTs are stateless and may remain cryptographically valid until they expire; RLS checks the inactive profile on every database request, so those tokens do not retain Brightloop data access. Auth session revocation behavior depends on the Auth service's token/session lifecycle; the endpoint does not claim that an already-issued access JWT is erased.
+
+## Tax, invoice, and quotation workflow
+
+Create quotations and invoices with `create_quotation_with_items` and `create_invoice_with_items`; create subscriptions with `create_subscription_with_items`. The RPCs accept tax-rate IDs, validate that the rate is configured and active, and calculate immutable line tax snapshots. A subscription's customer and a linked invoice's customer must match. Direct client inserts into financial line items and updates to financial totals/status are restricted; line items can be edited only while their parent remains a draft. Issue invoices using `issue_invoice(uuid)`. Use `void_invoice(uuid)` for eligible unpaid invoices; financial documents are not hard-deleted. Retire catalog entries by setting `is_active = false`; historical product/plan references are protected by restrictive foreign keys.
+
+Recurring invoice generation is handled by `generate_due_recurring_invoices(p_as_of, p_limit)`. It locks due subscriptions, uses canonical cycle boundaries, enforces a unique period per subscription, blocks overlaps and unresolved prior balances, and is safe to retry. Invoke it only from a trusted scheduled server-side job using the service role; never call it with a service key from the browser. The database function is ready for a future scheduler, but no scheduler has been configured or run here. Payment of an eligible recurring invoice records an idempotent renewal event and advances subscription expiry. If a subscription was closed after an invoice was issued, that invoice can still settle but will not reopen the closed subscription.
+
+Staff/admin can manage configured tax rates; financial records store the selected rate and calculated amount at document creation. Later tax-rate edits do not change existing invoice or quotation snapshots. Discounts are selected by ID, calculated in SQL, reserved transactionally for invoices, limited once per invoice, and reversed when an eligible invoice is voided.
+
+## Currency formatter
+
+Import `formatInr` from `src/lib/currency.js`. It accepts finite numbers or numeric strings (including Supabase `NUMERIC` strings); null, blank strings, booleans, and non-finite values throw `TypeError` rather than silently formatting as zero.

@@ -5,7 +5,6 @@ import Topbar from './Topbar.jsx';
 
 export default function MainLayout() {
   const [mobileOpen, setMobileOpen] = useState(false);
-
   return (
     <div className="app-shell">
       <Sidebar mobileOpen={mobileOpen} onClose={() => setMobileOpen(false)} />
